@@ -29,6 +29,8 @@ signals:
     void ptzAdjustmentNeeded(int pan, int tilt);
 
 private:
+    void updateKalman(float nx, float ny, float dt);
+    void predictKalman(float dt, float& pred_nx, float& pred_ny);
     void captureLoop();
     void processPTZControl(const cv::Mat& frame, const std::vector<Detection>& detections, float dt);
     Detection selectBestTarget(const cv::Mat& frame, const std::vector<Detection>& detections);
@@ -46,13 +48,23 @@ private:
     QThread* captureThread;
     std::unique_ptr<YOLODetector> detector;
     
-    // PID control state
     float integral_x, integral_y;
     float prev_err_x, prev_err_y;
     float filtered_derivative_x, filtered_derivative_y;
     float prev_ptz_speed_x, prev_ptz_speed_y;
     float last_nx, last_ny, last_nz;
     int lost_frames;
+    
+    // Kalman filter (4 states: x, y, vx, vy)
+    cv::Mat kalman_state;
+    cv::Mat kalman_cov;
+    float kalman_q, kalman_r;
+    bool kalman_initialized;
+    
+    // Deadzone & throttle
+    float deadzone_inner, deadzone_outer;
+    std::chrono::steady_clock::time_point last_visca_time;
+    int visca_throttle_ms;
     
     // Manual mode
     bool manual_mode;

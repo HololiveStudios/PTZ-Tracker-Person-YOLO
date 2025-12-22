@@ -26,12 +26,15 @@ signals:
 private:
     void sendCommand(const QByteArray &cmd);
     QString commandToString(const QByteArray &cmd);
+    bool shouldThrottle();
     
     std::unique_ptr<QSerialPort> serial;
     bool connected;
     int lastPanSpeed;
     int lastTiltSpeed;
     int lastZoomSpeed;
+    std::chrono::steady_clock::time_point lastCommandTime;
+    int minCommandInterval;
 };
 
 #endif

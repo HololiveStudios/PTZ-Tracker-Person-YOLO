@@ -6,33 +6,45 @@
 CaptureEngine::CaptureEngine(const std::string& source, int fps, float threshold)
     : videoSource(source), targetFPS(fps), confThreshold(threshold), 
       running(false), captureThread(nullptr), autoTracking(false),
-      // PID state
       integral_x(0), integral_y(0), prev_err_x(0), prev_err_y(0),
       filtered_derivative_x(0), filtered_derivative_y(0),
       prev_ptz_speed_x(0), prev_ptz_speed_y(0),
       last_nx(0.5), last_ny(0.5), last_nz(0),
       lost_frames(0), manual_mode(false),
-      manual_target_x(0.5), manual_target_y(0.5)
+      manual_target_x(0.5), manual_target_y(0.5),
+      kalman_initialized(false)
 {
     detector = std::make_unique<YOLODetector>("yolov8n.onnx", threshold);
     
-    // Parâmetros de controle
     conf_min = 0.5f;
     nz_min = 0.02f;
     deadband = 0.03f;
     
-    Kp_x = 1.2f; Ki_x = 0.05f; Kd_x = 0.06f;
-    Kp_y = 1.0f; Ki_y = 0.05f; Kd_y = 0.05f;
+    Kp_x = 1.5f; Ki_x = 0.08f; Kd_x = 0.12f;
+    Kp_y = 1.3f; Ki_y = 0.08f; Kd_y = 0.10f;
     I_max = 0.5f;
     
-    gamma = 0.8f;
-    near_edge_threshold = 0.15f;
+    gamma = 0.75f;
+    near_edge_threshold = 0.20f;
     approach_limit = 0.05f;
-    v_thresh = 0.02f;
-    slew_rate = 0.6f;
-    lpf_tau = 0.08f;
-    stop_threshold = 0.02f;
-    lost_max_frames = 15;
+    v_thresh = 0.03f;
+    slew_rate = 1.2f;
+    lpf_tau = 0.05f;
+    stop_threshold = 0.015f;
+    lost_max_frames = 10;
+    
+    // Kalman init
+    kalman_state = cv::Mat::zeros(4, 1, CV_32F);
+    kalman_cov = cv::Mat::eye(4, 4, CV_32F) * 0.1f;
+    kalman_q = 0.01f;
+    kalman_r = 0.05f;
+    
+    // Deadzone: 60-80% screen center
+    deadzone_inner = 0.20f;
+    deadzone_outer = 0.40f;
+    
+    visca_throttle_ms = 80;
+    last_visca_time = std::chrono::steady_clock::now();
 }
 
 CaptureEngine::~CaptureEngine() {
@@ -70,6 +82,64 @@ void CaptureEngine::resetPIDState() {
     prev_ptz_speed_x = 0;
     prev_ptz_speed_y = 0;
     lost_frames = 0;
+    kalman_initialized = false;
+    kalman_state = cv::Mat::zeros(4, 1, CV_32F);
+    kalman_cov = cv::Mat::eye(4, 4, CV_32F) * 0.1f;
+}
+
+// src/CaptureEngine.cpp - ADD após resetPIDState()
+void CaptureEngine::updateKalman(float nx, float ny, float dt) {
+    if (!kalman_initialized) {
+        kalman_state.at<float>(0) = nx;
+        kalman_state.at<float>(1) = ny;
+        kalman_state.at<float>(2) = 0;
+        kalman_state.at<float>(3) = 0;
+        kalman_initialized = true;
+        return;
+    }
+    
+    // Predict: x_k = F * x_{k-1}
+    cv::Mat F = (cv::Mat_<float>(4, 4) << 
+        1, 0, dt, 0,
+        0, 1, 0, dt,
+        0, 0, 1, 0,
+        0, 0, 0, 1);
+    
+    kalman_state = F * kalman_state;
+    
+    cv::Mat Q = cv::Mat::eye(4, 4, CV_32F) * kalman_q;
+    kalman_cov = F * kalman_cov * F.t() + Q;
+    
+    // Update: measurement z = [nx, ny]
+    cv::Mat H = (cv::Mat_<float>(2, 4) << 
+        1, 0, 0, 0,
+        0, 1, 0, 0);
+    
+    cv::Mat z = (cv::Mat_<float>(2, 1) << nx, ny);
+    cv::Mat y = z - H * kalman_state;
+    
+    cv::Mat R = cv::Mat::eye(2, 2, CV_32F) * kalman_r;
+    cv::Mat S = H * kalman_cov * H.t() + R;
+    cv::Mat K = kalman_cov * H.t() * S.inv();
+    
+    kalman_state = kalman_state + K * y;
+    kalman_cov = (cv::Mat::eye(4, 4, CV_32F) - K * H) * kalman_cov;
+}
+
+void CaptureEngine::predictKalman(float dt, float& pred_nx, float& pred_ny) {
+    if (!kalman_initialized) {
+        pred_nx = last_nx;
+        pred_ny = last_ny;
+        return;
+    }
+    
+    // Predict 2 frames ahead
+    float lookahead = dt * 2.0f;
+    pred_nx = kalman_state.at<float>(0) + kalman_state.at<float>(2) * lookahead;
+    pred_ny = kalman_state.at<float>(1) + kalman_state.at<float>(3) * lookahead;
+    
+    pred_nx = std::clamp(pred_nx, 0.0f, 1.0f);
+    pred_ny = std::clamp(pred_ny, 0.0f, 1.0f);
 }
 
 void CaptureEngine::start() {
@@ -163,17 +233,14 @@ void CaptureEngine::processPTZControl(const cv::Mat& frame,
     bool target_found = false;
     
     if (manual_mode) {
-        // Modo manual: usar coordenada do clique
         nx = manual_target_x;
         ny = manual_target_y;
         nz = 0.1f;
         target_found = true;
     } else if (!detections.empty()) {
-        // Auto mode: selecionar melhor alvo
         Detection bestTarget = selectBestTarget(frame, detections);
         
         if (bestTarget.confidence >= conf_min) {
-            // Normalizar bbox
             float cx = bestTarget.bbox.x + bestTarget.bbox.width / 2.0f;
             float cy = bestTarget.bbox.y + bestTarget.bbox.height / 2.0f;
             float diag = std::sqrt(frame.cols * frame.cols + frame.rows * frame.rows);
@@ -183,6 +250,7 @@ void CaptureEngine::processPTZControl(const cv::Mat& frame,
             nz = std::sqrt(bestTarget.bbox.width * bestTarget.bbox.height) / diag;
             
             if (nz >= nz_min) {
+                updateKalman(nx, ny, dt);
                 target_found = true;
                 last_nx = nx;
                 last_ny = ny;
@@ -196,33 +264,43 @@ void CaptureEngine::processPTZControl(const cv::Mat& frame,
         lost_frames++;
         
         if (lost_frames < lost_max_frames) {
-            // Manter último comando com decaimento
-            integral_x *= 0.95f;
-            integral_y *= 0.95f;
-            nx = last_nx;
-            ny = last_ny;
+            integral_x *= 0.90f;
+            integral_y *= 0.90f;
+            
+            float pred_nx, pred_ny;
+            predictKalman(dt, pred_nx, pred_ny);
+            nx = pred_nx;
+            ny = pred_ny;
         } else {
-            // Alvo perdido - parar
             if (autoTracking) {
                 emit ptzAdjustmentNeeded(0, 0);
             }
             return;
         }
+    } else {
+        // Use Kalman prediction for smoother tracking
+        float pred_nx, pred_ny;
+        predictKalman(dt, pred_nx, pred_ny);
+        nx = 0.7f * nx + 0.3f * pred_nx;
+        ny = 0.7f * ny + 0.3f * pred_ny;
     }
     
-    // Calcular erro normalizado
     float err_x = nx - 0.5f;
     float err_y = ny - 0.5f;
     float err_mag = std::sqrt(err_x * err_x + err_y * err_y);
     
-    // Modo manual: parar quando próximo do alvo
     if (manual_mode && err_mag < stop_threshold) {
         manual_mode = false;
         emit ptzAdjustmentNeeded(0, 0);
         return;
     }
     
-    // Aplicar deadband
+    // Dynamic deadzone: 60-80% screen = no movement
+    if (err_mag < deadzone_inner) {
+        emit ptzAdjustmentNeeded(0, 0);
+        return;
+    }
+    
     float err_x_eff = applyDeadband(err_x);
     float err_y_eff = applyDeadband(err_y);
     
@@ -300,14 +378,27 @@ void CaptureEngine::processPTZControl(const cv::Mat& frame,
     ptz_speed_x = std::clamp(ptz_speed_x, 1.0f, 2.0f);
     ptz_speed_y = std::clamp(ptz_speed_y, 1.0f, 2.0f);
     
-    // Converter para comandos PTZ com direção
-    int pan_cmd = static_cast<int>(ptz_speed_x * std::copysign(1.0f, err_x_eff) * 6.0f);
-    int tilt_cmd = static_cast<int>(-ptz_speed_y * std::copysign(1.0f, err_y_eff) * 5.0f);
+    // Variable speed based on distance + velocity
+    float vx = kalman_initialized ? kalman_state.at<float>(2) : 0;
+    float vy = kalman_initialized ? kalman_state.at<float>(3) : 0;
+    float v_mag = std::sqrt(vx * vx + vy * vy);
     
-    // Enviar comando apenas se significativo
-    if (std::abs(err_x_eff) > 0.01f || std::abs(err_y_eff) > 0.01f) {
+    float speed_mult = 1.0f + std::min(v_mag * 15.0f, 1.5f);
+    
+    int pan_cmd = static_cast<int>(ptz_speed_x * std::copysign(1.0f, err_x_eff) * 8.0f * speed_mult);
+    int tilt_cmd = static_cast<int>(-ptz_speed_y * std::copysign(1.0f, err_y_eff) * 7.0f * speed_mult);
+    
+    pan_cmd = std::clamp(pan_cmd, -24, 24);
+    tilt_cmd = std::clamp(tilt_cmd, -20, 20);
+    
+    // VISCA throttle
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_visca_time).count();
+    
+    if ((std::abs(err_x_eff) > 0.01f || std::abs(err_y_eff) > 0.01f) && elapsed >= visca_throttle_ms) {
         emit ptzAdjustmentNeeded(pan_cmd, tilt_cmd);
-    } else if (!manual_mode) {
+        last_visca_time = now;
+    } else if (!manual_mode && err_mag < deadzone_inner) {
         emit ptzAdjustmentNeeded(0, 0);
     }
     

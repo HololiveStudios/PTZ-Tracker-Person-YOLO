@@ -2,14 +2,19 @@
 #include <algorithm>
 
 YOLODetector::YOLODetector(const std::string& modelPath, float confThreshold)
-    : confidenceThreshold(confThreshold), nmsThreshold(0.45f)
+    : confidenceThreshold(confThreshold), nmsThreshold(0.45f), useCuda(false)
 {
-    // Carrega modelo YOLO ONNX
     net = cv::dnn::readNetFromONNX(modelPath);
-    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
     
-    // Classes COCO (apenas pessoa = 0)
+    try {
+        net.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+        net.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+        useCuda = true;
+    } catch (...) {
+        net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+        net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    }
+    
     classNames = {"person"};
 }
 
@@ -18,18 +23,23 @@ void YOLODetector::setConfidenceThreshold(float threshold) {
 }
 
 std::vector<Detection> YOLODetector::detect(const cv::Mat& frame) {
-    // Preprocessamento
     cv::Mat blob;
-    cv::dnn::blobFromImage(frame, blob, 1.0/255.0, 
-        cv::Size(416, 416), cv::Scalar(), true, false);
+    
+    if (useCuda) {
+        cv::cuda::GpuMat gpuFrame, gpuBlob;
+        gpuFrame.upload(frame);
+        cv::dnn::blobFromImage(frame, blob, 1.0/255.0, 
+            cv::Size(640, 640), cv::Scalar(), true, false);
+    } else {
+        cv::dnn::blobFromImage(frame, blob, 1.0/255.0, 
+            cv::Size(640, 640), cv::Scalar(), true, false);
+    }
     
     net.setInput(blob);
     
-    // Forward pass
     std::vector<cv::Mat> outputs;
     net.forward(outputs, net.getUnconnectedOutLayersNames());
     
-    // Parse detecções
     return parseDetections(outputs, frame.size());
 }
 

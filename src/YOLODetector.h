@@ -1,3 +1,4 @@
+// src/YOLODetector.h
 #ifndef YOLODETECTOR_H
 #define YOLODETECTOR_H
 
@@ -24,6 +25,7 @@ private:
     float confidenceThreshold;
     float nmsThreshold;
     std::vector<std::string> classNames;
+    bool useCuda;
     
     std::vector<Detection> parseDetections(
         const std::vector<cv::Mat>& outputs,

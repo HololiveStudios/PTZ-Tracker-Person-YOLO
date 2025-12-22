@@ -2,8 +2,10 @@
 #include <QThread>
 
 PTZController::PTZController(const std::string &port, int baudrate)
-    : connected(false), lastPanSpeed(0), lastTiltSpeed(0), lastZoomSpeed(0)
+    : connected(false), lastPanSpeed(0), lastTiltSpeed(0), lastZoomSpeed(0),
+      minCommandInterval(40)
 {
+    lastCommandTime = std::chrono::steady_clock::now();
     serial = std::make_unique<QSerialPort>();
     serial->setPortName(QString::fromStdString(port));
     serial->setBaudRate(baudrate);
@@ -25,6 +27,13 @@ PTZController::~PTZController() {
     if (serial && serial->isOpen()) {
         serial->close();
     }
+}
+
+// src/PTZController.cpp - ADD method
+bool PTZController::shouldThrottle() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCommandTime).count();
+    return elapsed < minCommandInterval;
 }
 
 void PTZController::panTilt(int pan, int tilt) {
@@ -131,13 +140,12 @@ void PTZController::openMenu() {
 }
 
 void PTZController::sendCommand(const QByteArray &cmd) {
-    if (serial && serial->isOpen()) {
+    if (serial && serial->isOpen() && !shouldThrottle()) {
         serial->write(cmd);
         serial->flush();
-        serial->waitForBytesWritten(100);
+        serial->waitForBytesWritten(50);
         
-        QThread::msleep(40);
-        
+        lastCommandTime = std::chrono::steady_clock::now();
         emit commandSent(commandToString(cmd));
     }
 }
